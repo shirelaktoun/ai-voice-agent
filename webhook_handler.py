@@ -33,27 +33,60 @@ CALL_ACCEPT_PAYLOAD = {
     }
 }
 
+# Call IDs with a live WebSocket handler, so ended calls can be cleaned up
+active_calls = set()
+active_calls_lock = threading.Lock()
+
+# --- Call Control ---
+def hangup_call(call_id):
+    """
+    Ends a call by asking OpenAI to hang up the SIP leg.
+    Returns True if the hangup request was accepted.
+    """
+    hangup_url = f"https://api.openai.com/v1/realtime/calls/{call_id}/hangup"
+    try:
+        response = requests.post(hangup_url, headers=AUTH_HEADER, timeout=10)
+        response.raise_for_status()
+        print(f"Hung up call {call_id}. Status: {response.status_code}")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to hang up call {call_id}: {e}")
+        return False
+
 # --- WebSocket Task ---
 async def websocket_task(call_id):
     """
     Handles the WebSocket connection for a given call.
+    Exits cleanly when the call ends (the server closes the socket), and
+    hangs up the call if the handler fails unexpectedly so it isn't left open.
     """
     uri = f"wss://api.openai.com/v1/realtime?call_id={call_id}"
     print(f"Connecting to WebSocket at {uri}")
 
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
 
+    with active_calls_lock:
+        active_calls.add(call_id)
+
     try:
-        async with websockets.connect(uri, extra_headers=headers) as websocket:
+        async with websockets.connect(uri, additional_headers=headers) as websocket:
             print(f"WebSocket connected for call_id: {call_id}")
 
-            # Listen for messages from the WebSocket
-            while True:
-                response = await websocket.recv()
-                print(f"Received from WebSocket: {response}")
+            # Listen for messages until the call ends and the socket closes
+            async for message in websocket:
+                print(f"Received from WebSocket: {message}")
 
+        print(f"Call {call_id} ended (WebSocket closed).")
+
+    except websockets.exceptions.ConnectionClosed as e:
+        print(f"Call {call_id} ended (connection closed: {e}).")
     except Exception as e:
         print(f"WebSocket error for call_id {call_id}: {e}")
+        # The handler can no longer serve this call, so end it
+        await asyncio.to_thread(hangup_call, call_id)
+    finally:
+        with active_calls_lock:
+            active_calls.discard(call_id)
 
 # --- Webhook Handler ---
 @app.route("/webhook", methods=["POST"])
